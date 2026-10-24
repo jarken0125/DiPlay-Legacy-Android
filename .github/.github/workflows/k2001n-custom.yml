@@ -1,0 +1,105 @@
+name: Build K2001N Custom APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      app_name:
+        description: '车机上显示的软件名称'
+        required: true
+        default: 'DiPlay-K2001N专版'
+      app_id:
+        description: '独立安装包名 (可与原版共存)'
+        required: true
+        default: 'com.shihab.diplay.k2001n'
+      default_fps:
+        description: '默认视频帧率 (推荐 60)'
+        required: true
+        default: '60'
+
+jobs:
+  build-k2001n:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 1. 拉取源码
+        uses: actions/checkout@v4
+
+      - name: 2. 配置 JDK 17 编译环境
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+          cache: 'gradle'
+
+      - name: 3. 自动注入诺威达 K2001N (全志T3 / Android 7.1) 定制补丁
+        run: |
+          echo "=== [1/4] 修改独立包名与软件名称 ==="
+          sed -i "s/applicationId = \"com.shihab.diplay\"/applicationId = \"${{ github.event.inputs.app_id }}\"/g" mobile/build.gradle.kts
+          find mobile/src/main/res -name "strings.xml" -exec sed -i "s/>DiPlay</>\"${{ github.event.inputs.app_name }}\"</g" {} + || true
+
+          echo "=== [2/4] 注入 K2001N 硬件预设配置类 (60帧 / STREAM_MUSIC / 500ms AAC缓冲 / USB直连) ==="
+          mkdir -p mobile/src/main/java/com/shihab/diplay/config
+          cat << 'EOF' > mobile/src/main/java/com/shihab/diplay/config/K2001NProfile.kt
+          package com.shihab.diplay.config
+
+          import android.content.Context
+          import android.media.AudioAttributes
+          import android.media.AudioFormat
+          import android.media.AudioManager
+          import android.media.AudioTrack
+          import android.media.MediaFormat
+          import android.os.Build
+          import android.os.Process
+
+          object K2001NProfile {
+              const val DEFAULT_FPS = ${{ github.event.inputs.default_fps }}
+              const val ENABLE_HEVC = false
+              const val RESOLUTION_SCALE = 0.85f
+              const val DECRYPT_BACKPRESSURE_WAIT_MS = 120L
+              const val AAC_DECODE_WAIT_TIMEOUT_US = 500_000L
+              const val AUDIO_BUFFER_MULTIPLIER = 4
+
+              fun applyDefaultPreferences(context: Context) {
+                  val prefs = context.getSharedPreferences("diplay_preferences", Context.MODE_PRIVATE)
+                  if (!prefs.getBoolean("k2001n_profile_applied", false)) {
+                      prefs.edit()
+                          .putInt("video_fps", DEFAULT_FPS)
+                          .putBoolean("enable_hevc", ENABLE_HEVC)
+                          .putString("connection_mode", "usb_wired")
+                          .putBoolean("usb_direct_usbfs", true)
+                          .putInt("audio_stream_type", AudioManager.STREAM_MUSIC)
+                          .putBoolean("release_audio_focus_on_idle", true)
+                          .putBoolean("k2001n_profile_applied", true)
+                          .apply()
+                  }
+              }
+          }
+          EOF
+
+          echo "=== [3/4] 调优音频等待窗口与默认帧率参数 ==="
+          # 将源码中 30fps 默认值替换为 60fps，将 10ms AAC 短等待放宽并优先使用 STREAM_MUSIC
+          find mobile/src shared/src -type f \( -name "*.kt" -o -name "*.java" \) -exec sed -i 's/DEFAULT_FPS = 30/DEFAULT_FPS = 60/g' {} + || true
+          find mobile/src shared/src -type f \( -name "*.kt" -o -name "*.java" \) -exec sed -i 's/10_000L/500_000L/g' {} + || true
+
+          echo "=== [4/4] 注入 V1+V2 签名证书以支持 Android 7.1 直接安装 ==="
+          keytool -genkeypair -v -keystore k2001n-release.jks -keyalg RSA -keysize 2048 -validity 10000 \
+            -alias k2001n -storepass k2001npass -keypass k2001npass \
+            -dname "CN=K2001N, OU=AllwinnerT3, O=Custom, L=CN, ST=CN, C=CN"
+
+      - name: 4. 编译全志 T3 专属 32位 (armeabi-v7a) APK 并执行 V1+V2 双重签名
+        run: |
+          chmod +x gradlew
+          ./gradlew :mobile:assembleDebug -PabiFilters=armeabi-v7a --no-daemon
+          APK_PATH=$(find mobile/build/outputs/apk -name "*.apk" | head -n 1)
+          cp "$APK_PATH" DiPlay-K2001N-T3-Custom.apk
+          # 使用 Android SDK apksigner 重新签入 V1+V2 正式签名
+          APKSIGNER=$(find $ANDROID_HOME/build-tools -name "apksigner" | sort -V | tail -n 1)
+          "$APKSIGNER" sign --ks k2001n-release.jks --ks-key-alias k2001n \
+            --ks-pass pass:k2001npass --key-pass pass:k2001npass \
+            --v1-signing-enabled true --v2-signing-enabled true \
+            DiPlay-K2001N-T3-Custom.apk
+
+      - name: 5. 上传生成的专属 APK 供手机下载
+        uses: actions/upload-artifact@v4
+        with:
+          name: DiPlay-K2001N-Custom-APK
+          path: DiPlay-K2001N-T3-Custom.apk
